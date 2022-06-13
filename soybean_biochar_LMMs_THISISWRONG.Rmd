@@ -1,0 +1,67 @@
+---
+title: "Analysis of Soybean Biochar data"
+author: "Quentin D. Read"
+date: "6/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+*note*: I apologize for not using your nice code but it was just easier for me to write something from scratch than to try to pick through and modify existing code, especially after I realized that we would need to do a different way of assessing the difference between pre-treatment and post-treatment values.
+
+# Load packages and data
+
+```{r}
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(emmeans)
+library(multcomp)
+library(lme4)
+library(performance)
+
+theme_set(
+  theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank())
+)
+
+Plaquemine <- read_xlsx('project/Plaquemine R.xlsx')
+setDT(Plaquemine)
+```
+
+# Pre-processing
+
+Get rid of the existing difference rows and rename the date values to something meaningful. Reorder the treatment factor so that control comes first, to make the model results more interpretable later. Convert blocking factor columns to factor.
+
+```{r}
+Plaquemine <- Plaquemine[!Date %in% 'Sep-Jun']
+Plaquemine[, Date := ifelse(Date == '44364', 'Jun', 'Sep')]
+Plaquemine[, Treatment := factor(Treatment, levels = c('Control', 'Biochar'))]
+factor_cols <- c('Date', 'Block', 'Row', 'Replication')
+Plaquemine[, (factor_cols) := lapply(.SD, factor), .SDcols = factor_cols]
+```
+
+Now convert the data to long form, take the average of all variables' two replications, then make a separate column by date and then take the difference and ratio.
+
+```{r}
+Plaquemine_long <- melt(Plaquemine, id.vars = c('Location', 'Date', 'Treatment', 'Block', 'Row','Replication'))[
+  , .(value = mean(value)), by = .(Location, Date, Treatment, Block, Row, variable)] |>
+  dcast(Location + Treatment + Block + Row + variable ~ Date) 
+
+Plaquemine_long[, diff := Sep - Jun]
+Plaquemine_long[, ratio := Sep / Jun]
+```
+
+Take a look at the distributions of the different variables.
+
+```{r}
+
+ggplot(data = Plaquemine_long) +
+  geom_density(aes(x = Jun), alpha = 0.5, fill = palette.colors()[2]) +
+  geom_density(aes(x = Sep), alpha = 0.5, fill = palette.colors()[3]) +
+  facet_grid(variable ~ Treatment, scales = 'free_x') +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.y = element_blank())
+  
+```
+

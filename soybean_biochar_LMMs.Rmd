@@ -1,0 +1,261 @@
+---
+title: "Analysis of Soybean Biochar data"
+author: "Quentin D. Read"
+date: "6/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+*initial note*: I apologize for not using your nice code but it was just easier for me to write something from scratch than to try to pick through and modify existing code, especially after I realized that we would need to do a different way of assessing the difference between pre-treatment and post-treatment values.
+
+# Background
+
+After I thought about it and did a little bit of background reading, I realized that I did not give you the correct advice on our Teams call. It is incorrect to take a difference or ratio of the pre-treatment and post-treatment data and then analyze those values. In fact, that throws away information because it does not include information about what the actual pre and post values are for each treatment. 
+
+What we really have here is a **controlled before-after** study design which can be analyzed with the so-called **difference-in-differences** method. That's a term from economics literature but it applies here. This means that there is some underlying trend over time that occurs between June and September. We can make the counterfactual assumption that *if we had not applied the biochar treatment to the treatment plots* the trend in control and treatment plots would have been the same. And since the treatment and control plots were assigned randomly, that should be a good assumption because there should really be no difference between them before the treatment. So we're looking at whether the *difference* between control and biochar is *different* between June and September (hence the name difference-in-differences). If it is, then we can say that the trend over time was modified by the biochar treatment, thus it had an effect. Maybe a picture is helpful, this is one I made with fake data (code not shown), in a hypothetical situation where we have lots of time points before and after treatment -- here we only have one before and one after but the same logic applies. In the fake example you can see there is a bit of an underlying upward trend in both control and treated, but after the treatment is applied the treated plots have a change even greater than what you would have expected if they hadn't gotten the treatment. Thus this example would probably show an effect of the treatment.
+
+```{r, echo = FALSE}
+library(ggplot2)
+
+theme_set(
+  theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank())
+)
+
+fakedat <- data.frame(time = rep(1:8, 2), 
+                      treatment = rep(c('control','treated'), each = 8),
+                      value = c(3, 2, 4, 4, 5, 4, 4.5, 5, 4, 2, 3, 4.5, 8, 8, 9, 8))
+
+ggplot(fakedat, aes(x = time, y = value, color = treatment, group = treatment)) +
+  geom_point() + geom_line() + geom_vline(xintercept = 4.5, size = 1) +
+  annotate(geom = 'text', x = 4.5, y = 3, label = 'treatment\napplied here', hjust = -0.1) +
+  ggtitle('THIS IS A FAKE DATASET FOR EXAMPLE PURPOSES ONLY :-D')
+```
+
+How do we do the stats? Well, it's nothing more than including an effect for treatment, an effect for date, and an effect for treatment by date interaction. The treatment by date interaction is what we look at. If it's significant, then the treated plots are different than the control plots *depending on date*. Because there are probably no differences before the treatment, that should mean that the treatment changed the value of the response variable after it was applied. (*N.B.*: we still need our mixed model because we still want to have random intercepts controlling for the random variation by row and by position the soil samples were taken within the row.)
+
+Okay, now let's go ahead and apply this model to a bunch of different response variables and look at the outcome!
+
+# Load packages and data
+
+```{r}
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(gridExtra)
+library(emmeans)
+library(multcomp)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(purrr)
+library(gt)
+
+theme_set(
+  theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank())
+)
+
+Plaquemine <- read_xlsx('project/Plaquemine R.xlsx')
+setDT(Plaquemine)
+```
+
+# Pre-processing
+
+Get rid of the existing difference rows and rename the date values to something meaningful. Reorder the treatment factor so that control comes first, to make the model results more interpretable later. Convert blocking factor columns to factor. Finally, make variable names easier to parse by removing punctuation and spaces. 
+
+```{r}
+Plaquemine <- Plaquemine[!Date %in% 'Sep-Jun']
+Plaquemine[, Date := ifelse(Date == '44364', 'Jun', 'Sep')]
+Plaquemine[, Treatment := factor(Treatment, levels = c('Control', 'Biochar'))]
+
+ID_cols <- c('Date', 'Location', 'Treatment', 'Block', 'Row', 'Replication')
+factor_cols <- c('Date', 'Block', 'Row', 'Replication')
+Plaquemine[, (factor_cols) := lapply(.SD, factor), .SDcols = factor_cols]
+
+newnames <- gsub('[[:punct:]]', '', names(Plaquemine))
+newnames <- gsub('\\s', '_', newnames)
+setnames(Plaquemine, newnames)
+```
+
+# Exploratory plots of the data
+
+Let's take a look at the distributions of our response variables. Make a separate density plot for each variable, separating by date and treatment. We should see that the distributions are more or less the same pre-treatment, and if there's a treatment effect they should differ more post-treatment. Also this plot will help us see any potential skew in the data that might cause the residuals to misbehave later, identifying whether we might need to do any transformations. Next to that, let's create an interaction plot. We want to look at whether the slope of the line differs between control and treatment. We'd typically expect a flat line for control and a line sloping either up or down for treatment. I also included an error bar going from 25% to 75% percentile around the median for each group.
+
+I think these plots are interesting because they already show to some degree which ones should have an interaction between treatment and date. If the two lines in the interaction plot are parallel, there is no treatment effect. If they are not, there may be an interaction between treatment and date meaning that the treatment caused a different trend over time. 
+
+```{r, fig.show="hold", out.width="50%"}
+response_variables <- setdiff(names(Plaquemine), ID_cols)
+
+draw_density_plot <- function(resp_var) {
+  ggplot(Plaquemine, aes_string(x = resp_var)) +
+    geom_density(alpha = 0.5, aes(fill = Treatment)) +
+    scale_fill_manual(values = unname(palette.colors()[2:3])) +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+    facet_wrap(~ Date) + 
+    theme(legend.position = 'none')
+}
+
+draw_interaction_plot <- function(resp_var) {
+  ggplot(Plaquemine, aes_string(x = 'Date', y = resp_var)) +
+    stat_summary(geom = 'pointrange', aes(color = Treatment), fun = median, fun.min = function(x) quantile(x, 0.25), fun.max = function(x) quantile(x, 0.75), position = position_dodge(width = 0.1)) +
+    stat_summary(geom = 'line', fun = median, aes(color = Treatment, group = Treatment), size = 1, position = position_dodge(width = 0.1)) +
+    scale_color_manual(values = unname(palette.colors()[2:3])) 
+}
+
+sidebyside_plots <- function(resp_var) {
+  p1 <- draw_density_plot(resp_var)
+  p2 <- draw_interaction_plot(resp_var)
+  grid.arrange(p1 + ggtitle(resp_var), p2, nrow = 1)
+}
+
+walk(response_variables, sidebyside_plots)
+
+```
+
+# Note on transformations
+
+For these type of data, I think it's more important to transform the data based on biological meaning rather than looking at the residuals. Basically, I think almost all of these data need a log transformation when doing the analysis. That's because almost all of them are concentrations or ratios. Multiplicative differences in concentrations or ratios are typically more meaningful than additive. For example, if a concentration doubles it could go from 0.1 to 0.2 or from 10 to 20. The difference of the logarithms of 0.1 and 0.2 is the same as the difference of the logarithms of 10 and 20. So that's why I am going to log transform almost all the variables. I am not sure what the "partial charge" variables represent but I log transformed them too. The only one I didn't was pH because it is the negative log of the concentration of hydrogen ions, so it's already on a log scale!
+
+A few of the variables have negative or zero values. For the `Fix_C` variables the negative and zero values don't seem to make sense so I will get rid of them (there are only 4 such values). For the `Milliequivalent_H` and `Partial_charge_H` variables there are no negative values but there are quite a few zero values. I added 0.1 to those variables when fitting the model to deal with that issue. That is a little bit *ad hoc* but I think it is OK.
+
+Feel free to change any of this if you disagree with the approach.
+
+Getting rid of invalid values in the `Fix_C` variables.
+
+```{r}
+Plaquemine[Fix_C_db <= 0, Fix_C_db := NA]
+Plaquemine[Fix_C_wb <= 0, Fix_C_wb := NA]
+```
+
+Here is the list of transformations needed, in the same order as response variables.
+
+```{r}
+transformations <- rep(c('log', 'none', 'log', 'log_plus_0.1', 'log'), c(7, 1, 12, 2, 3))
+
+gt(as.data.frame(cbind(response_variables, transformations)))
+```
+
+
+# Fitting models
+
+The following code fits the statistical models for each response variable (log transforming where necessary). Next, it makes some residual diagnostic plots to make sure the model is OK. Then it generates an ANOVA table to get the test statistic and p-value associated with the treatment by date interaction term for each response variable.  Next, it gets the estimated marginal means so that we can create an interaction plot with the modeled values and their 95% confidence intervals for each response variable. Finally it draws the interaction plot. The same code is applied iterating over all the response variable columns.
+
+Fit the models:
+
+```{r}
+model_fits <- map2(response_variables, transformations, function(resp_var, transformation) {
+  y <- resp_var
+  if (transformation == 'log') y <- paste0('log(', y, ')')
+  if (transformation == 'log_plus_0.1') y <- paste0('log(', y, ' + 0.1)')
+  model_formula <- paste(y, '~ Treatment + Date + Treatment:Date + (1|Block) + (1|Row)')
+  lmer(model_formula, data = Plaquemine)
+})
+
+all_fits <- data.table(response_variable = response_variables, transformation = transformations, fit = model_fits)
+```
+
+Generate residual plots to test for homogeneity of variance and normality of residuals (normal Q-Q plot) and draw them. I don't see any gross violations of the assumptions on these plots. Oddly, some of the residuals look like they almost have a trend where the higher the fitted value, the lower the residual variance. Usually, you are more worried about the opposite. To me I think that is just a chance result due to the relatively small dataset so I don't think any of these diagnostic plots have anything to worry about.
+
+```{r, fig.show = "hold", out.width = "50%"}
+all_fits[, resid_plots := map(fit, check_model, check = c('homogeneity', 'qq'))]
+
+walk2(all_fits$response_variable, all_fits$resid_plots, 
+      \(resp_var, resid_plot) print(plot(resid_plot) + patchwork::plot_annotation(title = resp_var)))
+```
+
+Generate the ANOVA tables and estimated marginal means for each response variable. Use Kenward-Roger method for estimating denominator degrees of freedom in both cases (it's slightly more conservative).
+
+```{r}
+all_fits[, ANOVA := map(fit, anova)]
+all_fits[, emm := map(fit, emmeans, specs = ~ Treatment + Date)]
+```
+
+Generate the interaction plots from the estimated marginal means, indicating significance with a **bold p-value** printed at the top of the plot panel where the treatment by date interaction is significant. These are similar to the interaction plots above, except that instead of using the raw data with quantiles, they use the estimated marginal mean as the point estimate, with their 95% confidence intervals as the error bars. Back-transform everything that was transformed.
+
+```{r}
+draw_emmeans_interaction_plot <- function(response_variable, emm, ANOVA, transformation, ...) {
+  plot_dat <- as.data.table(emm)
+  num_cols <- c('emmean', 'lower.CL', 'upper.CL')
+  p_value <- ANOVA[3, 6] # p-value associated with treatment x date interaction
+  font_face <- ifelse(p_value < 0.05, 'bold', 'plain')
+  
+  if (transformation == 'log') plot_dat[, (num_cols) := lapply(.SD, exp), .SDcols = num_cols]
+  if (transformation== 'log_plus_0.1') plot_dat[, (num_cols) := lapply(.SD, function(x) exp(x) - 0.1), .SDcols = num_cols]
+  
+  ggplot(plot_dat, aes(x = Date, y = emmean, ymin = lower.CL, ymax = upper.CL, color = Treatment, group = Treatment)) +
+    geom_pointrange(position = position_dodge(width = 0.1)) +
+    geom_line(size = 1, position = position_dodge(width = 0.1)) +
+    annotate(geom = 'text', x = 1.5, y = Inf, vjust = 1, label = paste('p =', signif(p_value, 2)), fontface = font_face) +
+    scale_color_manual(values = unname(palette.colors()[2:3])) +
+    ggtitle(response_variable) + labs(y = response_variable) +
+    theme(legend.position = 'bottom')
+}
+
+all_fits[, int_plot := pmap(all_fits, draw_emmeans_interaction_plot)]
+```
+
+# Results
+
+Display the results for each response variable, including the ANOVA table showing the significance of the test statistic for the treatment-by-date interaction, the estimated marginal means table showing the means and confidence intervals for each combination of treatment by date, and the interaction plots with the fitted values.
+
+## ANOVA tables
+
+The F-statistic and p-value that correspond with the hypothesis test is the treatment &times; date interaction. The main effect of treatment probably should not be interpreted, and the main effect of date corresponds to whether there is an overall time trend between June and September regardless of whether biochar was applied. Significant results are observed for **VM on dry and wet basis, ash on dry basis, and organic matter**.
+
+```{r, echo = FALSE, results = 'asis'}
+all_anovas <- map2_dfr(all_fits$response_variable, all_fits$ANOVA, function(rv, at) {
+  cbind(response_variable = rv, term = c('treatment', 'date', 'treatment &times; date'), as.data.frame(at))
+}) |> setDT()
+
+# Truncate all p-values below a threshold
+all_anovas[, `Pr(>F)` := ifelse(`Pr(>F)` < 0.0001, '< 0.0001', signif(`Pr(>F)`, 3))]
+
+# Convert term column to html
+all_anovas[, term := map(term, html)]
+
+gt(all_anovas, groupname_col = 'response_variable') %>%
+  cols_label(term = '') %>%
+  fmt_number(columns = c(3,4,6,7), n_sigfig = 3) %>%
+  tab_options(
+    row_group.background.color = "#D4EBF2",
+    row_group.font.weight = 'bold',
+    column_labels.font.weight = 'bold'
+  ) %>%
+  cols_align('left', columns = term)
+```
+
+## Estimated marginal means tables
+
+Again these are all back-transformed to the original scale if a log or `log(x+0.1)` transformation was applied.
+
+```{r, echo = FALSE}
+all_emms <- pmap_dfr(all_fits, function(response_variable, emm, transformation, ...) {
+  emm_dat <- as.data.table(emm)
+  
+  num_cols <- c('emmean', 'lower.CL', 'upper.CL')
+
+  if (transformation == 'log') emm_dat[, (num_cols) := lapply(.SD, exp), .SDcols = num_cols]
+  if (transformation== 'log_plus_0.1') emm_dat[, (num_cols) := lapply(.SD, function(x) exp(x) - 0.1), .SDcols = num_cols]
+  
+  emm_dat[, response_variable := response_variable]
+  emm_dat
+})
+
+gt(all_emms, groupname_col = 'response_variable') %>%
+  fmt_number(columns = c(3,4,5,6,7), n_sigfig = 3) %>%
+  tab_options(
+    row_group.background.color = "#D4EBF2",
+    row_group.font.weight = 'bold',
+    column_labels.font.weight = 'bold'
+  )
+```
+
+## Interaction plots
+
+```{r, echo = FALSE, fig.show = "hold", out.width = "50%"}
+walk(all_fits$int_plot, print)
+```
+
