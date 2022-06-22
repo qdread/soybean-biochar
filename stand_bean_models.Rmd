@@ -1,0 +1,220 @@
+---
+title: "Pod and stand count models"
+author: "Quentin D. Read"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Here are some additional statistical models for the stand counts and pod counts. They differ from the previous ones because we do not have pre-post data. That makes the model simpler because we don't have any date or treatment-by-date effects. So the stand count model will be simple. However the pod counts require an *ordered multinomial* regression because we are predicting the probabilities of an event with more than 2 possible outcomes that are ordered. In this case each pod can be modeled as having a probability of having <3, 3, 4, and 5 beans; the probabilities sum to 1, and they are ordered in the sense that 5 > 4 > 3, etc.
+
+# Load data
+
+```{r}
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(gridExtra)
+library(emmeans)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(ordinal)
+
+theme_set(
+  theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank())
+)
+
+stand <- read_xlsx('~/temp/9-21-21 Soybean bean_stand count.xlsx', sheet = 2)
+setDT(stand)
+
+bean <- read_xlsx('~/temp/9-21-21 Soybean bean_stand count.xlsx', sheet = 1)
+setDT(bean)
+```
+
+# Pre-processing
+
+Get rid of extra columns. Set the names to be consistent across data frames. Make a column for treatment. Convert Row and Block to factors.
+
+```{r}
+stand <- stand[, 1:5]
+stand[, Treatment := factor(ifelse(substr(Treatment, 1, 1) == 'B', 'biochar', 'control'), levels = c('control', 'biochar'))]
+stand[, Row := factor(Row)]
+stand[, Block := factor(Block)]
+
+bean <- bean[, 1:9]
+bean[, Treatment := factor(ifelse(substr(`BC-NBC`, 1, 1) == 'B', 'biochar', 'control'), levels = c('control', 'biochar'))]
+setnames(bean, old = 'Length', new = 'Block')
+bean[, Row := factor(Row)]
+bean[, Block := factor(Block)]
+```
+
+For bean count, make a long form data frame with one row per bean pod. (So for example sample 1, row 1, length 1/3, plant 1 had 40 pods so it will have 40 rows in the extended data frame.) This format is needed for the multinomial model. Convert that variable to an ordered factor. Also calculate a column in the original bean count data frame for total pods per plant.
+
+```{r}
+bean_levels <- c('<3 beans', '3 beans', '4 beans', '5 beans')
+bean_long <- bean[, .(beans = rep(bean_levels, c(`<3 beans`, `3 beans`, `4 beans`, `5 beans`))), by = .(Sample, Row, Treatment, Block, Plant)]
+bean_long[, beans := factor(beans, levels = bean_levels, ordered = TRUE)]
+
+bean[, n_pods := `<3 beans` + `3 beans` + `4 beans` + `5 beans`]
+```
+
+# Exploratory plots
+
+Before fitting the model, let's look at the data. First make a density plot and boxplot of stand for each treatment. Judging from the plot there should not be a significant difference as the ranges of data almost completely overlap and the median is about the same for both.
+
+```{r}
+xscale <- scale_x_continuous(expand = c(0, 0), limits = range(stand$Stand))
+
+p1 <- ggplot(stand, aes(x = Stand, fill = Treatment)) + 
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = unname(palette.colors()[2:3])) +
+  xscale +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  theme(legend.position = 'bottom', axis.text.y = element_blank(), axis.title.y = element_blank(), axis.ticks.y = element_blank())
+
+p2 <- ggplot(stand, aes(x = Stand, fill = Treatment, y = Treatment)) + 
+  geom_boxplot() +
+  scale_fill_manual(values = unname(palette.colors()[2:3])) +
+  xscale +
+  theme_void() +
+  theme(legend.position = 'none')
+
+grid.arrange(p2, p1, nrow = 2, heights = c(0.3, 1))
+```
+
+Do the same for number of pods. Again we should not expect any difference.
+
+```{r}
+xscale <- scale_x_continuous(expand = c(0, 0), limits = range(bean$n_pods))
+
+p1 <- ggplot(bean, aes(x = n_pods, fill = Treatment)) + 
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = unname(palette.colors()[2:3])) +
+  xscale +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  theme(legend.position = 'bottom', axis.text.y = element_blank(), axis.title.y = element_blank(), axis.ticks.y = element_blank())
+
+p2 <- ggplot(bean, aes(x = n_pods, fill = Treatment, y = Treatment)) + 
+  geom_boxplot() +
+  scale_fill_manual(values = unname(palette.colors()[2:3])) +
+  xscale +
+  theme_void() +
+  theme(legend.position = 'none')
+
+grid.arrange(p2, p1, nrow = 2, heights = c(0.3, 1))
+```
+
+Finally, make a bar plot of the total numbers of pods with each number of beans in each treatment. These look almost identical.
+
+```{r}
+bean_totals <- bean_long[, .(total_pods = .N), by = .(Treatment, beans)]
+
+ggplot(bean_totals, aes(x = beans, y = total_pods, group = Treatment, fill = Treatment)) +
+  geom_col(position = 'dodge') +
+  scale_fill_manual(values = unname(palette.colors()[2:3])) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  theme(legend.position = c(0.8, 0.8))
+```
+
+# Models
+
+## Stand
+
+Just do a general linear model, because it is probably acceptable to use a normal approximation.
+
+```{r}
+fit_stand <- lmer(Stand ~ Treatment + (1|Row) + (1|Block), data = stand)
+```
+
+The residuals look fine.
+
+```{r}
+check_model(fit_stand, check = c('homogeneity', 'qq'))
+```
+
+
+The F-test (ANOVA) shows no difference between treatments.
+
+```{r}
+anova(fit_stand)
+```
+
+Here is a plot of the estimated marginal means showing no difference.
+
+```{r}
+emm_stand <- emmeans(fit_stand, ~ Treatment)
+
+ggplot(as.data.frame(emm_stand), aes(x = Treatment, y = emmean, ymin = lower.CL, ymax = upper.CL, color = Treatment)) +
+  geom_pointrange(size = 1) +
+  scale_color_manual(values = unname(palette.colors()[2:3])) +
+  scale_y_continuous(name = 'Stand', limits = c(0, 55)) +
+  theme(legend.position = 'none')
+```
+
+## Total number of pods
+
+Follow the same model as stand. I had to switch to a different algorithm to get the model to converge. See [this post](https://stats.stackexchange.com/questions/242109/model-failed-to-converge-warning-in-lmer).
+
+```{r}
+fit_npods <- lmer(n_pods ~ Treatment + (1|Row) + (1|Block), data = bean,
+                  control = lmerControl(optimizer ="Nelder_Mead"))
+```
+
+Again the residuals look fine.
+
+```{r}
+check_model(fit_npods, check = c('homogeneity', 'qq'))
+```
+
+ANOVA shows no difference.
+
+```{r}
+anova(fit_npods)
+```
+
+Again the plot of the estimated marginal means shows no difference.
+
+```{r}
+emm_npods <- emmeans(fit_npods, ~ Treatment)
+
+ggplot(as.data.frame(emm_npods), aes(x = Treatment, y = emmean, ymin = lower.CL, ymax = upper.CL, color = Treatment)) +
+  geom_pointrange(size = 1) +
+  scale_color_manual(values = unname(palette.colors()[2:3])) +
+  scale_y_continuous(name = 'Number of pods per plant', limits = c(0, 35)) +
+  theme(legend.position = 'none')
+```
+
+## Number of beans per pod
+
+This one is more complicated because we have an ordered multinomial response. But the `clmm()` function in the `ordinal` package can fit this "cumulative linear mixed model." It is called cumulative because we are fitting the cumulative probabilities of having n beans or higher per pod. Also we now have to have a random effect for plant because we have many pods per plant with correlated probabilities. I just got rid of the random effects of row and block to simplify the model. The differences are minimal between treatments so we do not have to worry that much about the random effects being just right; we are unlikely to see a difference in any case.
+
+```{r}
+bean_long[, PlantID := interaction(Plant, Row, Block)]
+fit_nbeans <- clmm(beans ~ Treatment + (1|PlantID), data = bean_long)
+```
+
+We cannot do an ANOVA here so we will just look at the treatment coefficient (the threshold coefficients are like intercepts). We see that it is close to zero with a p-value close to 1. So there's no difference in the probability of having a certain number of beans per pod between the treatments.
+
+```{r}
+summary(fit_nbeans)
+```
+
+We can get the estimated marginal means (cumulative probabilities) for each class for each treatment and plot them, which is another way of showing lack of difference. The trend is the same for both treatments. Each treatment had about 40% with less than 3 beans, about 59% with 3 beans, and a very few individual pods with 4 or 5 beans.
+
+```{r}
+grid_nbeans <- ref_grid(fit_nbeans, mode = 'linear.predictor')
+emm_nbeans <- emmeans(grid_nbeans, ~ Treatment + cut, mode = 'prob', type = 'response')
+
+ggplot(as.data.frame(emm_nbeans), aes(x = cut, y = cumprob, ymin = asymp.LCL, ymax = asymp.UCL, color = Treatment, group = Treatment)) +
+  geom_line(position = position_dodge(width = 0.05)) + 
+  geom_pointrange(position = position_dodge(width = 0.05)) +
+  scale_x_discrete(name = 'Number of beans', labels = c(3, 4, 5)) +
+  labs(y = 'Probability of having less than n beans') +
+  scale_color_manual(values = unname(palette.colors()[2:3])) +
+  theme(legend.position = c(0.8, 0.2))
+```
+
