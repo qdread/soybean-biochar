@@ -28,10 +28,10 @@ theme_set(
   theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank())
 )
 
-stand <- read_xlsx('~/temp/9-21-21 Soybean bean_stand count.xlsx', sheet = 2)
+stand <- read_xlsx('project/9-21-21 Soybean bean_stand count.xlsx', sheet = 2)
 setDT(stand)
 
-bean <- read_xlsx('~/temp/9-21-21 Soybean bean_stand count.xlsx', sheet = 1)
+bean <- read_xlsx('project/9-21-21 Soybean bean_stand count.xlsx', sheet = 1)
 setDT(bean)
 ```
 
@@ -190,7 +190,7 @@ ggplot(as.data.frame(emm_npods), aes(x = Treatment, y = emmean, ymin = lower.CL,
 
 ## Number of beans per pod
 
-This one is more complicated because we have an ordered multinomial response. But the `clmm()` function in the `ordinal` package can fit this "cumulative linear mixed model." It is called cumulative because we are fitting the cumulative probabilities of having n beans or higher per pod. Also we now have to have a random effect for plant because we have many pods per plant with correlated probabilities. I just got rid of the random effects of row and block to simplify the model. The differences are minimal between treatments so we do not have to worry that much about the random effects being just right; we are unlikely to see a difference in any case.
+This one is more complicated because we have an ordered multinomial response. But the `clmm()` function in the `ordinal` package can fit this "cumulative linear mixed model." It is called cumulative because we are fitting the cumulative probabilities of having n beans or lower per pod. Also we now have to have a random effect for plant because we have many pods per plant with correlated probabilities. I just got rid of the random effects of row and block to simplify the model. The differences are minimal between treatments so we do not have to worry that much about the random effects being just right; we are unlikely to see a difference in any case.
 
 ```{r}
 bean_long[, PlantID := interaction(Plant, Row, Block)]

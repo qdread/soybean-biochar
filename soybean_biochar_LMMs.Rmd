@@ -166,7 +166,7 @@ walk2(all_fits$response_variable, all_fits$resid_plots,
       \(resp_var, resid_plot) print(plot(resid_plot) + patchwork::plot_annotation(title = resp_var)))
 ```
 
-Generate the ANOVA tables and estimated marginal means for each response variable. Use Kenward-Roger method for estimating denominator degrees of freedom in both cases (it's slightly more conservative).
+Generate the ANOVA tables and estimated marginal means for each response variable. Use Satterthwaite method for estimating denominator degrees of freedom in both cases.
 
 ```{r}
 all_fits[, ANOVA := map(fit, anova)]
