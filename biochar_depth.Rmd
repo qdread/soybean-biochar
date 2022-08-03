@@ -1,0 +1,262 @@
+---
+title: "Biochar addition effects at different soil depths"
+author: "Quentin D. Read"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Summary
+
+This is an analysis of biochar effects on soil properties post-harvest in cotton fields. Biochar was added at different levels. I'm not sure whether the ultimate goal is to add data from the corn part of the study to the same analysis or to look at them both separately (hopefully Jean or Isabel can answer that question). If corn is added later, the crop type and interactions will have to be added as terms to the mixed model.
+
+In the model, biochar addition is a *continuous* fixed effect because there are four levels (0, 10, 20, and 40) that represent increasing amounts added. 
+
+Another issue is that there are only measurements at different soil depths (0-6 in. and 6-12 in.) for 2020 and 2021. In 2019 everything from 0-12 in. was bulked together. Because of this, I also set depth as a continuous fixed effect. In 2019, the 0-12 is averaged to 6, and in the other years, the two depth values are 3 and 9. So we assume that the effect of treatment changes linearly with increasing biochar addition, and the effect of depth is also linear. There is also an interaction term between treatment and depth.
+
+The model has a random effect for replicate (random intercept) and a random effect for year (random intercept and random slope, to allow the treatment effect to vary by year).
+
+The results show that increasing biochar adddition level significantly affects a number of soil properties. For some of the soil properties, the effect is different depending on soil depth (with typically a larger effect at shallower soil depth, as you might expect).
+
+# Load packages and data
+
+```{r}
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(gridExtra)
+library(emmeans)
+library(multcomp)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(purrr)
+library(gt)
+
+theme_set(
+  theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank())
+)
+
+cotton <- read_xlsx('C:/Users/qdread/onedrive_usda/ars_projects/lima/biochar_depth/Sri Cotton Master.xlsx', sheet = 1, na = 'NA')
+setDT(cotton)
+```
+
+# Pre-processing
+
+This is a pretty clean dataset. We just need to make sure the ID columns are factors with the correct ordering. However treatment could be a continuous variable in the model (i.e., amount of biochar added) so we will leave it as an integer for now. Also, get rid of punctuation and spaces in the names which makes things a lot easier.
+
+One other change is to convert depth to a continuous variable so that the depths from the different years can be compared. 0-6 will be set to 3, 6-12 to 9, and 0-12 to 6.
+
+```{r}
+cotton[, Year := factor(substr(Date, 1, 4))]
+cotton[, Depth := factor(Depth, levels = c("0-12\"", "0-6\"", "6-12\""), labels = c('0-12', '0-6', '6-12'))]
+cotton[, Rep := factor(Rep)]
+
+newnames <- gsub('[[:punct:]]', '', names(cotton))
+newnames <- gsub('\\s', '_', newnames)
+newnames <- gsub('^_', '', newnames)
+setnames(cotton, newnames)
+
+cotton[, Depth_numeric := fcase(Depth == '0-12', 6, Depth == '0-6', 3, Depth == '6-12', 9)]
+```
+
+# Exploratory plots of data
+
+Let's look at the distributions for each response variable. Because there are not that many data points, I am going to use dot plots. Data from all years and depths are combined.
+
+```{r, fig.show="hold", out.width="50%"}
+ID_cols <- c('Date', 'Depth', 'Depth_numeric', 'Plot', 'Rep', 'Trt', 'Year')
+response_variables <- sort(setdiff(names(cotton), ID_cols))
+
+draw_dot_plot <- function(resp_var) {
+  ggplot(cotton, aes(x = !!ensym(resp_var))) +
+    geom_dotplot(stackgroups = TRUE, binpositions = 'all', alpha = 0.5, aes(fill = factor(Trt))) +
+    scale_fill_manual(name = 'biochar level', values = unname(palette.colors()[2:5])) +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+    theme(legend.position = 'bottom') +
+    ggtitle(resp_var)
+}
+
+dot_plots <- map(response_variables, draw_dot_plot)
+
+walk(dot_plots, print)
+```
+
+# Fit the models
+
+I will take log transformation of all the concentration variables. For the partial charge variables that contain zeros, I will add 0.1 before log-transforming. I will not log-transform pH and CEC. Exclude lime buffer pH from analysis because it seems problematic.
+
+```{r}
+all_fits <- data.table(response_variable = response_variables)
+all_fits <- all_fits[!response_variable %in% 'Lime_buffer_pH']
+all_fits[, transformation := fcase(
+  response_variable %in% c('pH', 'CEC'), 'none',
+  response_variable %in% c('Partial_charge_H', 'Milliequivalent_H'), 'log_plus_0.1',
+  default = 'log'
+)]
+```
+
+Fit models with fixed effects for treatment, depth, and their interaction, and random intercept for year. Also compare this with a model that includes a random slope for year as well. This is a good practice to try but it is unlikely that we will have enough data to accurately estimate the random slope for year.
+
+```{r}
+fit_model <- function(response_variable, transformation, random_slope, ...) {
+  y <- response_variable
+  if (transformation == 'log') y <- paste0('log(', y, ')')
+  if (transformation == 'log_plus_0.1') y <- paste0('log(', y, ' + 0.1)')
+  
+  if (random_slope) {
+    model_formula <- paste(y, '~ Trt + Depth_numeric + Trt:Depth_numeric + (1|Rep) + (Trt|Year)')
+  } else {
+    model_formula <- paste(y, '~ Trt + Depth_numeric + Trt:Depth_numeric + (1|Rep) + (1|Year)')
+  }
+  lmer(model_formula, data = cotton)
+}
+
+all_fits[, fit_randomintercept := pmap(all_fits, fit_model, random_slope = FALSE)]
+all_fits[, fit_randomslope := pmap(all_fits, fit_model, random_slope = TRUE)]
+```
+
+I think that the model with the random slope fit OK so we should keep using those.
+
+# Check residual diagnostic plots
+
+Here are the residual diagnostic plots. They do not look perfect but with such small datasets, it is common to see large deviations from assumptions so I do not think this is a problem.
+
+```{r, fig.show = "hold", out.width = "50%"}
+all_fits[, resid_plots := map(fit_randomslope, check_model, check = c('homogeneity', 'qq'))]
+
+walk2(all_fits$response_variable, all_fits$resid_plots, 
+      \(resp_var, resid_plot) print(plot(resid_plot) + patchwork::plot_annotation(title = resp_var)))
+```
+
+# Calculate ANOVA tables and estimated marginal means
+
+ANOVA tables using Kenward-Roger approximation to calculate denominator degrees of freedom, and estimated marginal means. We have to estimate treatment means at set values of biochar addition and soil depth as they are both continuous variables.
+
+```{r}
+all_fits[, ANOVA := map(fit_randomslope, anova, ddf = 'Kenward-Roger')]
+all_fits[, emm_grid := map(fit_randomslope, ref_grid, at = list(Trt = c(0, 10, 20, 40),
+                                                                Depth_numeric = c(3, 9)))]
+all_fits[, emm_trt_depth := map(emm_grid, emmeans, specs = ~ Trt + Depth_numeric)]
+all_fits[, emm_trt := map(emm_grid, emmeans, specs = ~ Trt)]
+```
+
+Back-transform the estimated marginal means.
+
+```{r}
+back_transform_emm <- function(transformation, emm) {
+  emm_df <- as.data.table(emm)
+  if (transformation == 'log') fn <- exp
+  if (transformation == 'log_plus_0.1') fn <- function(x) exp(x) - 0.1
+  if (transformation == 'none') fn <- c
+  trans_cols <- c('emmean', 'lower.CL', 'upper.CL')
+  emm_df[, (trans_cols) := lapply(.SD, fn), .SDcols = trans_cols]
+}
+
+all_fits[, emm_trt_depth := map2(transformation, emm_trt_depth, back_transform_emm)]
+all_fits[, emm_trt := map2(transformation, emm_trt, back_transform_emm)]
+```
+
+
+# Results
+
+## Interaction plots
+
+For each result, we will plot the estimated means of the response variables for the four values of biochar addition, with a line connecting them. There will be three lines, one for all soil depths averaged, one for the shallow soil layer, and one for the deep soil layer. Error bars show the 95% confidence intervals around the estimated means.
+
+First, combine all the plotting data into one data frame.
+
+```{r}
+emm_overall <- map2_dfr(all_fits$response_variable, all_fits$emm_trt, ~ cbind(response_variable = .x, Depth_numeric = 'overall', .y))
+emm_bydepth <- map2_dfr(all_fits$response_variable, all_fits$emm_trt_depth, ~ cbind(response_variable = .x, .y))
+
+plotting_data <- rbindlist(list(emm_overall, emm_bydepth), use.names = TRUE)
+```
+
+Make the plots. Include the treatment p-value and the treatment by depth p-value on them (extracted from the ANOVA).
+
+```{r,  fig.show="hold", out.width="50%"}
+pd <- position_dodge(width = 2)
+
+draw_interaction_plot <- function(dt) {
+  anova_table <- all_fits$ANOVA[[which(all_fits$response_variable == dt$response_variable[1])]]
+  p_values <- signif(anova_table[,6], 2)
+  ggplot(dt, aes(x = Trt, y = emmean, ymin = lower.CL, ymax = upper.CL, color = Depth_numeric, group = Depth_numeric)) +
+    geom_line(color = 'gray50', position = pd) +
+    geom_point(size = 2, position = pd) +
+    geom_errorbar(width = 2, position = pd) +
+    annotate(geom = 'text', x = -Inf, y = Inf, label = paste('treatment p-value =', p_values[1]), hjust = -0.1, vjust = 1) +
+    annotate(geom = 'text', x = -Inf, y = Inf, label = paste('treatment by depth p-value =', p_values[3]), hjust = -0.1, vjust = 3) +
+    scale_color_manual(values = c('#e69f00', '#56b4e9', 'black'), name = 'Soil depth layer', labels = c('0-6 in.', '6-12 in.', 'overall')) +
+    theme(legend.position = 'bottom') +
+    scale_x_continuous(breaks = c(0, 10, 20, 40)) +
+    labs(x = 'Biochar addition', y = dt$response_variable[1]) +
+    ggtitle(dt$response_variable[1])
+}
+
+interaction_plots <- split(plotting_data, plotting_data$response_variable) |>
+  map(draw_interaction_plot)
+
+walk(interaction_plots, print)
+```
+
+## ANOVA tables
+
+```{r, echo = FALSE, results = 'asis'}
+all_anovas <- map2_dfr(all_fits$response_variable, all_fits$ANOVA, function(rv, at) {
+  cbind(response_variable = rv, term = c('treatment', 'depth', 'treatment &times; depth'), as.data.frame(at))
+}) |> setDT()
+
+# Truncate all p-values below a threshold
+all_anovas[, `Pr(>F)` := ifelse(`Pr(>F)` < 0.0001, '< 0.0001', signif(`Pr(>F)`, 3))]
+
+# Convert term column to html
+all_anovas[, term := map(term, html)]
+
+gt(all_anovas, groupname_col = 'response_variable') %>%
+  cols_label(term = '') %>%
+  fmt_number(columns = c(3,4,6,7), n_sigfig = 3) %>%
+  tab_options(
+    row_group.background.color = "#D4EBF2",
+    row_group.font.weight = 'bold',
+    column_labels.font.weight = 'bold'
+  ) %>%
+  cols_align('left', columns = term)
+```
+
+## Estimated marginal means overall by treatment
+
+```{r, echo = FALSE}
+emm_overall[, Depth_numeric := NULL]
+emm_overall[, SE := NULL]
+
+gt(emm_overall, groupname_col = 'response_variable') %>%
+  cols_label(Trt = 'biochar level', emmean = 'estimated mean', df = 'd.f.', lower.CL = '95% CI lower', upper.CL = '95% ci upper') %>%
+  fmt_number(columns = 3:6, n_sigfig = 3) %>%
+  tab_options(
+    row_group.background.color = "#D4EBF2",
+    row_group.font.weight = 'bold',
+    column_labels.font.weight = 'bold'
+  ) 
+```
+
+
+## Estimated marginal means by combination of treatment and soil depth layer
+
+```{r, echo = FALSE}
+emm_bydepth[, SE := NULL]
+emm_bydepth[, Depth_numeric := ifelse(Depth_numeric == 3, '0-6 in.', '6-12 in.')]
+
+gt(emm_bydepth, groupname_col = 'response_variable') %>%
+  cols_label(Trt = 'biochar level', Depth_numeric = 'soil depth', emmean = 'estimated mean', df = 'd.f.', lower.CL = '95% CI lower', upper.CL = '95% ci upper') %>%
+  fmt_number(columns = 4:7, n_sigfig = 3) %>%
+  tab_options(
+    row_group.background.color = "#D4EBF2",
+    row_group.font.weight = 'bold',
+    column_labels.font.weight = 'bold'
+  ) 
+```
